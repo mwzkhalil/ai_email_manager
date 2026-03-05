@@ -2,21 +2,69 @@
 AI provider helpers.
 Implements the LLM fallback chain:
   OpenRouter → Groq → Gemini → OpenAI
+
+Changes:
+- Exponential backoff with jitter for 429 / 5xx errors per provider
+- Concurrent batch embeddings via asyncio semaphore (nomic-embed-text)
+- Provider retry config is centralised and easy to tune
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 import re
 from typing import Any
 
 import httpx
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 
 from config import get_settings
 
 log = logging.getLogger(__name__)
 settings = get_settings()
+
+# ---------------------------------------------------------------------------
+# Retry / backoff config
+# ---------------------------------------------------------------------------
+
+#: Maximum attempts per provider before moving to the next one
+MAX_RETRIES_PER_PROVIDER = 3
+#: Base delay (seconds) for exponential backoff
+BACKOFF_BASE = 1.5
+#: Cap on any single wait (seconds)
+BACKOFF_MAX = 30.0
+
+#: Max concurrent Ollama embedding requests — tune to your hardware
+EMBEDDING_CONCURRENCY = 8
+_embedding_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_embedding_semaphore() -> asyncio.Semaphore:
+    """Lazily create the semaphore inside a running event loop."""
+    global _embedding_semaphore
+    if _embedding_semaphore is None:
+        _embedding_semaphore = asyncio.Semaphore(EMBEDDING_CONCURRENCY)
+    return _embedding_semaphore
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff with ±25 % jitter."""
+    delay = min(BACKOFF_BASE ** attempt, BACKOFF_MAX)
+    jitter = delay * 0.25 * random.random()
+    return delay + jitter
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Return True for rate-limit or transient server errors."""
+    if isinstance(exc, RateLimitError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (429, 500, 502, 503, 504)
+    msg = str(exc).lower()
+    return "429" in msg or "rate limit" in msg or "too many requests" in msg
+
 
 # ---------------------------------------------------------------------------
 # Prompt templates
@@ -133,7 +181,6 @@ def _openai_client() -> AsyncOpenAI:
 
 
 async def _call_gemini(system: str, user: str, max_tokens: int = 1500) -> str:
-    """Call Gemini via REST since there's no async SDK parity needed."""
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"gemini-1.5-flash:generateContent?key={settings.gemini_api_key}"
@@ -151,30 +198,35 @@ async def _call_gemini(system: str, user: str, max_tokens: int = 1500) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Fallback chain
+# Fallback chain with per-provider retry + backoff
 # ---------------------------------------------------------------------------
 
 _ANALYSIS_PROVIDERS = [
-    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", lambda: _openrouter_client()),
-    ("groq",       "llama-3.3-70b-versatile", lambda: _groq_client()),
-    ("openai",     "gpt-4.1-mini",            lambda: _openai_client()),
+    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", _openrouter_client),
+    ("groq",       "llama-3.3-70b-versatile",              _groq_client),
+    ("openai",     "gpt-4.1-mini",                         _openai_client),
 ]
 
 _EOD_PROVIDERS = [
-    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", lambda: _openrouter_client()),
-    ("groq",       "llama-3.3-70b-versatile", lambda: _groq_client()),
-    ("openai",     "gpt-4o-mini",             lambda: _openai_client()),
+    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", _openrouter_client),
+    ("groq",       "llama-3.3-70b-versatile",              _groq_client),
+    ("openai",     "gpt-4o-mini",                          _openai_client),
 ]
 
 _CHAT_PROVIDERS = [
-    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", lambda: _openrouter_client()),
-    ("groq",       "llama-3.3-70b-versatile",            lambda: _groq_client()),
-    ("openai",     "gpt-4.1-mini",                       lambda: _openai_client()),
+    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", _openrouter_client),
+    ("groq",       "llama-3.3-70b-versatile",              _groq_client),
+    ("openai",     "gpt-4.1-mini",                         _openai_client),
 ]
 
 
 async def _call_provider(
-    name: str, model: str, client_factory: Any, system: str, user: str, max_tokens: int
+    name: str,
+    model: str,
+    client_factory: Any,
+    system: str,
+    user: str,
+    max_tokens: int,
 ) -> str:
     if name == "gemini":
         return await _call_gemini(system, user, max_tokens)
@@ -190,19 +242,61 @@ async def _call_provider(
     return resp.choices[0].message.content or ""
 
 
+async def _try_provider_with_retry(
+    name: str,
+    model: str,
+    factory: Any,
+    system: str,
+    user: str,
+    max_tokens: int,
+) -> str:
+    """
+    Attempt one provider up to MAX_RETRIES_PER_PROVIDER times.
+    Retries only on rate-limit / transient errors; raises immediately on
+    anything else so the fallback chain can move to the next provider.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(MAX_RETRIES_PER_PROVIDER):
+        try:
+            log.info("Trying LLM provider: %s / %s (attempt %d)", name, model, attempt + 1)
+            return await _call_provider(name, model, factory, system, user, max_tokens)
+        except Exception as exc:
+            if _is_retryable(exc):
+                wait = _backoff_delay(attempt)
+                log.warning(
+                    "Provider %s hit rate-limit / transient error (attempt %d/%d). "
+                    "Retrying in %.1fs. Error: %s",
+                    name, attempt + 1, MAX_RETRIES_PER_PROVIDER, wait, exc,
+                )
+                last_exc = exc
+                await asyncio.sleep(wait)
+            else:
+                # Non-retryable (auth error, bad request, etc.) — skip provider immediately
+                log.warning("Provider %s failed with non-retryable error: %s", name, exc)
+                raise
+
+    raise RuntimeError(
+        f"Provider {name} exhausted {MAX_RETRIES_PER_PROVIDER} retries. Last error: {last_exc}"
+    )
+
+
 async def _run_with_fallback(
-    providers: list[tuple], system: str, user: str, max_tokens: int = 1500
+    providers: list[tuple],
+    system: str,
+    user: str,
+    max_tokens: int = 1500,
 ) -> tuple[str, str]:
-    """Try each provider in order. Returns (raw_text, provider_name)."""
+    """Try each provider in order with per-provider retry. Returns (raw_text, provider_name)."""
     last_error: Exception | None = None
     for name, model, factory in providers:
         try:
-            log.info("Trying LLM provider: %s / %s", name, model)
-            text = await _call_provider(name, model, factory, system, user, max_tokens)
+            text = await _try_provider_with_retry(name, model, factory, system, user, max_tokens)
+            log.info("LLM provider succeeded: %s / %s", name, model)
             return text, name
         except Exception as exc:
-            log.warning("Provider %s failed: %s", name, exc)
+            log.warning("Provider %s fully failed, trying next. Error: %s", name, exc)
             last_error = exc
+
     raise RuntimeError(f"All LLM providers failed. Last error: {last_error}")
 
 
@@ -217,7 +311,6 @@ def _strip_fences(text: str) -> str:
 
 
 def _extract_json(text: str) -> str:
-    """Pull the first {...} block from text."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     return match.group(0) if match else text
 
@@ -227,7 +320,6 @@ def _parse_json_robust(raw: str) -> dict:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        # Attempt to escape unescaped newlines inside string values
         fixed = re.sub(r'(?<!\\)\n', r'\\n', cleaned)
         return json.loads(fixed)
 
@@ -239,10 +331,7 @@ async def analyze_email(
     received_date: str,
     clean_body: str,
 ) -> tuple[dict, str]:
-    """
-    Run the email analysis fallback chain.
-    Returns (parsed_analysis_dict, provider_name).
-    """
+    """Run the email analysis fallback chain. Returns (parsed_dict, provider_name)."""
     user_prompt = build_analysis_prompt(from_name, from_email, subject, received_date, clean_body)
     raw, provider = await _run_with_fallback(_ANALYSIS_PROVIDERS, ANALYSIS_SYSTEM_PROMPT, user_prompt)
     raw_json = _extract_json(raw)
@@ -250,26 +339,19 @@ async def analyze_email(
 
     # Normalise & validate
     data.setdefault("entities", {})
-    data["entities"].setdefault("people", [])
-    data["entities"].setdefault("organizations", [])
-    data["entities"].setdefault("locations", [])
-    data["entities"].setdefault("dates", [])
-    data["entities"].setdefault("keyTopics", [])
+    for key in ("people", "organizations", "locations", "dates", "keyTopics"):
+        data["entities"].setdefault(key, [])
     data.setdefault("suggestedReply", "")
     data.setdefault("reminderText", "")
 
     confidence = float(data.get("confidence", 0.95))
-    from config import get_settings as _gs
-    if confidence < _gs().ai_confidence_threshold:
+    if confidence < settings.ai_confidence_threshold:
         data["needsManualReview"] = True
     else:
         data.setdefault("needsManualReview", False)
 
-    # Auto-add sender to attendees when calendar event needed
     if data.get("needsCalendarEvent") and data.get("eventDetails"):
-        attendees = data["eventDetails"].get("attendees", [])
-        if not attendees:
-            attendees = [from_email]
+        attendees = data["eventDetails"].get("attendees") or [from_email]
         data["eventDetails"]["attendees"] = attendees
 
     return data, provider
@@ -285,7 +367,6 @@ async def generate_eod_summary(
     user_prompt = build_eod_prompt(date, stats, high_priority, all_emails)
     raw, provider = await _run_with_fallback(_EOD_PROVIDERS, EOD_SYSTEM_PROMPT, user_prompt, max_tokens=2000)
 
-    # Try to unwrap {"response": "..."} wrapper
     try:
         cleaned = _strip_fences(raw)
         wrapped = json.loads(cleaned)
@@ -305,18 +386,50 @@ async def chat_with_emails(context: str, query: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Embeddings
+# Embeddings — nomic-embed-text via Ollama, concurrent via semaphore
 # ---------------------------------------------------------------------------
 
 async def create_embedding(text: str) -> list[float]:
-    """Call Ollama nomic-embed-text to generate a vector embedding."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            settings.ollama_embedding_url,
-            json={"model": settings.embedding_model, "prompt": text},
-        )
-        resp.raise_for_status()
-        return resp.json().get("embedding", [])
+    """
+    Generate a single vector embedding via Ollama nomic-embed-text.
+    Respects the global EMBEDDING_CONCURRENCY semaphore so parallel calls
+    don't overwhelm the local Ollama server.
+    """
+    sem = _get_embedding_semaphore()
+    async with sem:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                settings.ollama_embedding_url,
+                json={"model": settings.embedding_model, "prompt": text},
+            )
+            resp.raise_for_status()
+            return resp.json().get("embedding", [])
+
+
+async def create_embeddings_batch(texts: list[str]) -> list[list[float]]:
+    """
+    Embed multiple texts concurrently.
+    All tasks run in parallel, throttled by EMBEDDING_CONCURRENCY.
+
+    Usage:
+        vectors = await create_embeddings_batch(["text one", "text two", ...])
+    """
+    if not texts:
+        return []
+
+    log.info("Creating embeddings for %d texts (concurrency=%d)", len(texts), EMBEDDING_CONCURRENCY)
+    tasks = [create_embedding(text) for text in texts]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    embeddings: list[list[float]] = []
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            log.error("Embedding failed for text[%d]: %s", i, result)
+            embeddings.append([])          # empty vector as sentinel; caller can filter
+        else:
+            embeddings.append(result)      # type: ignore[arg-type]
+
+    return embeddings
 
 
 def embedding_to_pg_vector(embedding: list[float]) -> str:
