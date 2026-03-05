@@ -155,19 +155,19 @@ async def _call_gemini(system: str, user: str, max_tokens: int = 1500) -> str:
 # ---------------------------------------------------------------------------
 
 _ANALYSIS_PROVIDERS = [
-    ("openrouter", "openai/gpt-4o-free", lambda: _openrouter_client()),
+    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", lambda: _openrouter_client()),
     ("groq",       "llama-3.3-70b-versatile", lambda: _groq_client()),
     ("openai",     "gpt-4.1-mini",            lambda: _openai_client()),
 ]
 
 _EOD_PROVIDERS = [
-    ("openrouter", "openai/gpt-4o-free", lambda: _openrouter_client()),
+    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", lambda: _openrouter_client()),
     ("groq",       "llama-3.3-70b-versatile", lambda: _groq_client()),
     ("openai",     "gpt-4o-mini",             lambda: _openai_client()),
 ]
 
 _CHAT_PROVIDERS = [
-    ("openrouter", "mistralai/mistral-7b-instruct:free", lambda: _openrouter_client()),
+    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", lambda: _openrouter_client()),
     ("groq",       "llama-3.3-70b-versatile",            lambda: _groq_client()),
     ("openai",     "gpt-4.1-mini",                       lambda: _openai_client()),
 ]
