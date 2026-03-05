@@ -1,3 +1,14 @@
+"""
+AI provider helpers.
+Implements the LLM fallback chain:
+  OpenRouter → Groq → Gemini → OpenAI
+
+Changes:
+- Exponential backoff with jitter for 429 / 5xx errors per provider
+- LLM concurrency semaphore to prevent thundering-herd on OpenRouter (8 req/min limit)
+- Concurrent batch embeddings via asyncio semaphore (nomic-embed-text)
+- Provider retry config is centralised and easy to tune
+"""
 from __future__ import annotations
 
 import asyncio
@@ -201,26 +212,32 @@ async def _call_gemini(system: str, user: str, max_tokens: int = 1500) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Fallback chain with per-provider retry + backoff
+# Fallback chain — free OpenRouter models first, paid as last resort
+#
+# Free models ordered by token throughput (highest first).
+# The chain auto-advances on 429 / rate-limit so you rarely hit paid APIs.
 # ---------------------------------------------------------------------------
 
-_ANALYSIS_PROVIDERS = [
-    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", _openrouter_client),
-    ("groq",       "llama-3.3-70b-versatile",              _groq_client),
-    ("openai",     "gpt-4.1-mini",                         _openai_client),
+_FREE_OR_MODELS: list[tuple] = [
+    # model-id                                                   throughput  ctx
+    ("openrouter", "openai/gpt-oss-120b:free",                  _openrouter_client),  # 4.4B tok  131K
+    ("openrouter", "arcee-ai/arcee-trinity-large-preview:free", _openrouter_client),  # 585B tok  128K
+    ("openrouter", "stepfun/step-3-5-flash:free",               _openrouter_client),  # 548B tok  256K
+    ("openrouter", "meta-llama/llama-3.3-70b-instruct:free",    _openrouter_client),  # 2.64B tok 128K
+    ("openrouter", "openai/gpt-oss-20b:free",                   _openrouter_client),  # 1.35B tok 131K
+    ("openrouter", "z-ai/glm-4-5-air:free",                     _openrouter_client),  #  62B tok  131K
+    ("openrouter", "nvidia/llama-3.3-nemotron-super-49b-v1:free", _openrouter_client),
+    ("openrouter", "arcee-ai/arcee-trinity-mini:free",          _openrouter_client),
 ]
 
-_EOD_PROVIDERS = [
-    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", _openrouter_client),
-    ("groq",       "llama-3.3-70b-versatile",              _groq_client),
-    ("openai",     "gpt-4o-mini",                          _openai_client),
+_PAID_FALLBACKS: list[tuple] = [
+    ("groq",   "llama-3.3-70b-versatile", _groq_client),
+    ("openai", "gpt-4.1-mini",            _openai_client),
 ]
 
-_CHAT_PROVIDERS = [
-    ("openrouter", "qwen/qwen3-next-80b-a3b-instruct:free", _openrouter_client),
-    ("groq",       "llama-3.3-70b-versatile",              _groq_client),
-    ("openai",     "gpt-4.1-mini",                         _openai_client),
-]
+_ANALYSIS_PROVIDERS = [*_FREE_OR_MODELS, *_PAID_FALLBACKS]
+_EOD_PROVIDERS      = [*_FREE_OR_MODELS, ("groq", "llama-3.3-70b-versatile", _groq_client), ("openai", "gpt-4o-mini", _openai_client)]
+_CHAT_PROVIDERS     = [*_FREE_OR_MODELS, *_PAID_FALLBACKS]
 
 
 async def _call_provider(
