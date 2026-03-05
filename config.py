@@ -20,11 +20,11 @@ class Settings(BaseSettings):
 
     # App Settings
     default_timezone: str = "Asia/Karachi"
-    email_fetch_limit: int = 10
+    email_fetch_limit: int = 8
     bulk_threshold: int = 1000
     ai_confidence_threshold: float = 0.7
     max_body_chars: int = 4000
-    semantic_search_limit: int = 10
+    semantic_search_limit: int = 8
 
     class Config:
         env_file = ".env"
