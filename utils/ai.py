@@ -1,13 +1,3 @@
-"""
-AI provider helpers.
-Implements the LLM fallback chain:
-  OpenRouter → Groq → Gemini → OpenAI
-
-Changes:
-- Exponential backoff with jitter for 429 / 5xx errors per provider
-- Concurrent batch embeddings via asyncio semaphore (nomic-embed-text)
-- Provider retry config is centralised and easy to tune
-"""
 from __future__ import annotations
 
 import asyncio
@@ -36,13 +26,26 @@ BACKOFF_BASE = 1.5
 #: Cap on any single wait (seconds)
 BACKOFF_MAX = 30.0
 
+#: Max concurrent LLM requests — OpenRouter free tier caps at 8 req/min,
+#: so limit to 4 to avoid thundering-herd when many emails arrive at once.
+LLM_CONCURRENCY = 4
+_llm_semaphore: asyncio.Semaphore | None = None
+
 #: Max concurrent Ollama embedding requests — tune to your hardware
 EMBEDDING_CONCURRENCY = 8
 _embedding_semaphore: asyncio.Semaphore | None = None
 
 
+def _get_llm_semaphore() -> asyncio.Semaphore:
+    """Lazily create the LLM semaphore inside a running event loop."""
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
+    return _llm_semaphore
+
+
 def _get_embedding_semaphore() -> asyncio.Semaphore:
-    """Lazily create the semaphore inside a running event loop."""
+    """Lazily create the embedding semaphore inside a running event loop."""
     global _embedding_semaphore
     if _embedding_semaphore is None:
         _embedding_semaphore = asyncio.Semaphore(EMBEDDING_CONCURRENCY)
@@ -286,16 +289,22 @@ async def _run_with_fallback(
     user: str,
     max_tokens: int = 1500,
 ) -> tuple[str, str]:
-    """Try each provider in order with per-provider retry. Returns (raw_text, provider_name)."""
-    last_error: Exception | None = None
-    for name, model, factory in providers:
-        try:
-            text = await _try_provider_with_retry(name, model, factory, system, user, max_tokens)
-            log.info("LLM provider succeeded: %s / %s", name, model)
-            return text, name
-        except Exception as exc:
-            log.warning("Provider %s fully failed, trying next. Error: %s", name, exc)
-            last_error = exc
+    """
+    Try each provider in order with per-provider retry. Returns (raw_text, provider_name).
+    Acquires the global LLM semaphore to cap concurrent requests and avoid
+    thundering-herd 429s when many emails are processed simultaneously.
+    """
+    sem = _get_llm_semaphore()
+    async with sem:
+        last_error: Exception | None = None
+        for name, model, factory in providers:
+            try:
+                result = await _try_provider_with_retry(name, model, factory, system, user, max_tokens)
+                log.info("LLM provider succeeded: %s / %s", name, model)
+                return result, name
+            except Exception as exc:
+                log.warning("Provider %s fully failed, trying next. Error: %s", name, exc)
+                last_error = exc
 
     raise RuntimeError(f"All LLM providers failed. Last error: {last_error}")
 

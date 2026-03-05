@@ -1,6 +1,3 @@
-"""
-Workflow 4: EOD Summary — generate, show, and email end-of-day summaries.
-"""
 from __future__ import annotations
 
 import base64
@@ -55,7 +52,7 @@ async def _get_existing_eod(user_email: str, today: str) -> dict | None:
             text("""
                 SELECT * FROM eod_summaries
                 WHERE user_email = :ue
-                  AND summary_date::date = :today::date
+                  AND summary_date::date = CAST(:today AS DATE)
                 LIMIT 1
             """),
             {"ue": user_email, "today": today},
@@ -77,8 +74,8 @@ async def _upsert_eod(
                 text("""
                     UPDATE eod_summaries
                     SET markdown_summary = :ms,
-                        email_count = :ec,
-                        updated_at = NOW()
+                        email_count      = :ec,
+                        updated_at       = NOW()
                     WHERE id = :id
                 """),
                 {"ms": markdown_summary, "ec": email_count, "id": eod_id},
@@ -88,7 +85,7 @@ async def _upsert_eod(
                 text("""
                     INSERT INTO eod_summaries
                         (summary_date, markdown_summary, email_count, user_email)
-                    VALUES (:sd, :ms, :ec, :ue)
+                    VALUES (CAST(:sd AS DATE), :ms, :ec, :ue)
                 """),
                 {
                     "sd": today,
@@ -117,7 +114,6 @@ async def eod_summary_generate(req: EODGenerateRequest) -> dict:
             "markdown_summary": f"# EOD Summary — {today}\n\nNo emails received today.",
         }
 
-    # Compute stats
     stats = {
         "total":          len(emails),
         "high":           sum(1 for e in emails if e.get("priority") == "high"),
@@ -173,7 +169,6 @@ async def show_eod(req: EODShowRequest) -> dict:
             "eod_id":           existing.get("id"),
         }
 
-    # No existing EOD → create one
     gen_req = EODGenerateRequest(
         access_token="",
         user_email=req.user_email,
@@ -188,30 +183,31 @@ async def show_eod(req: EODShowRequest) -> dict:
 
 @router.post("/send-eod-email")
 async def send_eod_email(req: EODEmailRequest) -> dict:
+    import base64 as _b64
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
     today = _today_str()
     existing = await _get_existing_eod(req.user_email, today)
 
     if not existing:
-        raise HTTPException(status_code=404, detail="No EOD summary found for today. Generate one first.")
+        raise HTTPException(
+            status_code=404,
+            detail="No EOD summary found for today. Generate one first.",
+        )
 
     markdown_summary = existing.get("markdown_summary", "")
-    email_count = existing.get("email_count", 0)
+    email_count      = existing.get("email_count", 0)
+    html_body        = format_eod_html_email(markdown_summary, today)
 
-    html_body = format_eod_html_email(markdown_summary, today)
-
-    subject = f"📊 EOD Summary - {today}"
+    subject     = f"📊 EOD Summary - {today}"
     subject_b64 = base64.b64encode(subject.encode("utf-8")).decode("utf-8")
 
-    # Build raw MIME email
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-    import base64 as _b64
-
     msg = MIMEMultipart("alternative")
-    msg["To"] = req.user_email
+    msg["To"]      = req.user_email
     msg["Subject"] = f"=?UTF-8?B?{subject_b64}?="
     msg.attach(MIMEText(markdown_summary, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    msg.attach(MIMEText(html_body,        "html",  "utf-8"))
 
     raw = _b64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
 
