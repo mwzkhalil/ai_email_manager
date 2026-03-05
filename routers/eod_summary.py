@@ -28,6 +28,12 @@ def _today_str() -> str:
     tz = pytz.timezone(settings.default_timezone)
     return datetime.now(tz).strftime("%Y-%m-%d")
 
+def _today_date():
+    from datetime import date as _date
+    tz = pytz.timezone(settings.default_timezone)
+    from datetime import datetime as _dt
+    return _dt.now(tz).date()
+
 
 async def _get_todays_emails(user_email: str, today: str) -> list[dict]:
     async with get_db() as db:
@@ -38,7 +44,7 @@ async def _get_todays_emails(user_email: str, today: str) -> list[dict]:
                        needs_reply, needs_calendar, needs_reminder
                 FROM email_store
                 WHERE user_email = :ue
-                  AND received_at::date = :today::date
+                  AND received_at::date = :today
                 ORDER BY received_at DESC
             """),
             {"ue": user_email, "today": today},
@@ -52,7 +58,7 @@ async def _get_existing_eod(user_email: str, today: str) -> dict | None:
             text("""
                 SELECT * FROM eod_summaries
                 WHERE user_email = :ue
-                  AND summary_date::date = CAST(:today AS DATE)
+                  AND summary_date = :today
                 LIMIT 1
             """),
             {"ue": user_email, "today": today},
@@ -103,7 +109,8 @@ async def _upsert_eod(
 
 @router.post("/eod-summary-generate")
 async def eod_summary_generate(req: EODGenerateRequest) -> dict:
-    today = _today_str()
+    today_str = _today_str()
+    today = _today_date()
     emails = await _get_todays_emails(req.user_email, today)
 
     if not emails:
@@ -136,7 +143,7 @@ async def eod_summary_generate(req: EODGenerateRequest) -> dict:
     return {
         "success":          True,
         "email_count":      len(emails),
-        "summary_date":     today,
+        "summary_date":     today_str,
         "markdown_summary": markdown_summary,
         "eod_id":           saved.get("id"),
         "provider":         provider,
@@ -149,7 +156,8 @@ async def eod_summary_generate(req: EODGenerateRequest) -> dict:
 
 @router.post("/show-eod")
 async def show_eod(req: EODShowRequest) -> dict:
-    today = _today_str()
+    today_str = _today_str()
+    today = _today_date()
     existing = await _get_existing_eod(req.user_email, today)
 
     if req.regenerate and existing:
@@ -187,7 +195,8 @@ async def send_eod_email(req: EODEmailRequest) -> dict:
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
 
-    today = _today_str()
+    today_str = _today_str()
+    today = _today_date()
     existing = await _get_existing_eod(req.user_email, today)
 
     if not existing:

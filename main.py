@@ -1,25 +1,5 @@
 """
 Email Manager — FastAPI Application
-=====================================
-A complete Python port of the 6-workflow n8n Email Manager system.
-
-Workflows implemented:
-  1. POST /email-manager         — Main ingestion + action routing
-  2. POST /ingest_email_bulk     — Bulk email ingestion
-  3. POST /get-emails            — Retrieve stored emails for frontend
-  4a. POST /eod-summary-generate — Generate end-of-day summary
-  4b. POST /show-eod             — Show / regenerate EOD summary
-  4c. POST /send-eod-email       — Email the EOD summary
-  5. POST /chat-email            — Semantic search + AI chat
-  6. POST /action_status         — Update action status on records
-
-Manual action endpoints:
-  POST /manual-create-calendar
-  POST /manual-send-reply
-  POST /manual-set-reminder
-
-Usage:
-  uvicorn main:app --reload --host 0.0.0.0 --port 8000
 """
 from __future__ import annotations
 
@@ -41,37 +21,21 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Lifespan (startup / shutdown)
-# ---------------------------------------------------------------------------
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting Email Manager API…")
-    try:
-        await init_db()
-        log.info("Database tables initialised.")
-    except Exception as exc:
-        log.warning("DB init skipped (check DATABASE_URL): %s", exc)
+    await init_db()          # ← let it raise so you see real errors on startup
+    log.info("Database tables initialised.")
     yield
     log.info("Email Manager API shutting down.")
 
 
-# ---------------------------------------------------------------------------
-# App factory
-# ---------------------------------------------------------------------------
-
 app = FastAPI(
     title="Email Manager API",
-    description=(
-        "AI-powered email management system with Gmail integration, "
-        "LLM analysis, vector search, calendar automation, and EOD summaries."
-    ),
     version="1.0.0",
     lifespan=lifespan,
 )
 
-# CORS — allow all origins in dev; restrict in production
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -80,10 +44,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ---------------------------------------------------------------------------
-# Global exception handler
-# ---------------------------------------------------------------------------
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -94,20 +54,12 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     )
 
 
-# ---------------------------------------------------------------------------
-# Include routers (webhook paths match original n8n paths exactly)
-# ---------------------------------------------------------------------------
-
 app.include_router(ingestion.router,   tags=["Ingestion"])
 app.include_router(get_emails.router,  tags=["Emails"])
 app.include_router(eod_summary.router, tags=["EOD Summary"])
 app.include_router(email_chat.router,  tags=["Chat"])
 app.include_router(actions.router,     tags=["Actions"])
 
-
-# ---------------------------------------------------------------------------
-# Health check
-# ---------------------------------------------------------------------------
 
 @app.get("/health", tags=["Health"])
 async def health() -> dict:
@@ -117,8 +69,8 @@ async def health() -> dict:
 @app.get("/", tags=["Health"])
 async def root() -> dict:
     return {
-        "service":  "Email Manager API",
-        "version":  "1.0.0",
+        "service": "Email Manager API",
+        "version": "1.0.0",
         "endpoints": [
             "POST /email-manager",
             "POST /ingest_email_bulk",

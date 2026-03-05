@@ -1,165 +1,191 @@
-# Email Manager API
+# 📧 AI Email Manager
 
-An implementation of the Email Manager system.
+An email management backend built with FastAPI, Gmail API, and LLM providers. Automatically ingests, analyses, and acts on emails with calendar creation, smart replies, reminders, EOD summaries, and semantic chat.
 
-## Architecture
+---
 
-```
-email_manager/
-├── main.py                    # FastAPI app + router registration
-├── config.py                  # Settings via pydantic-settings + .env
-├── requirements.txt
-├── .env.example
-├── models/
-│   └── schemas.py             # All Pydantic request/response models
-├── db/
-│   └── database.py            # Async SQLAlchemy engine, session, DDL
-├── utils/
-│   ├── ai.py                  # LLM fallback chain + embeddings
-│   ├── gmail.py               # Gmail API (fetch, parse, send, label)
-│   ├── calendar.py            # Google Calendar API
-│   └── markdown.py            # Markdown → HTML for EOD emails
-└── routers/
-    ├── ingestion.py           # Workflows 1 & 2 (main + bulk ingestion)
-    ├── get_emails.py          # Workflow 3 (get emails for frontend)
-    ├── eod_summary.py         # Workflow 4 (EOD generate/show/send)
-    ├── email_chat.py          # Workflow 5 (semantic chat)
-    └── actions.py             # Workflow 6 + manual endpoints
-```
+## Features
 
-## Endpoints
+- **Smart Ingestion** — fetches emails from Gmail, deduplicates, and runs AI analysis on each
+- **LLM Fallback Chain** — OpenRouter → Groq → OpenAI with exponential backoff and per-provider retry on 429s
+- **Auto Actions** — creates Google Calendar events, sends replies, stores reminders
+- **EOD Summaries** — generates end-of-day markdown summaries via LLM
+- **Semantic Chat** — query your emails in natural language
+- **Vector Embeddings** — nomic-embed-text via Ollama, with concurrent batch processing
 
-| Method | Path | Workflow | Description |
-|--------|------|----------|-------------|
-| POST | `/email-manager` | 1 | Fetch + analyse + store Gmail emails |
-| POST | `/ingest_email_bulk` | 2 | Bulk ingest all inbox emails |
-| POST | `/get-emails` | 3 | Retrieve stored emails for frontend |
-| POST | `/eod-summary-generate` | 4a | Generate AI end-of-day summary |
-| POST | `/show-eod` | 4b | Show or regenerate today's EOD |
-| POST | `/send-eod-email` | 4c | Email the EOD summary to user |
-| POST | `/chat-email` | 5 | Semantic search + AI chat over emails |
-| POST | `/action_status` | 6 | Update action status on email record |
-| POST | `/manual-create-calendar` | — | Manually create calendar event |
-| POST | `/manual-send-reply` | — | Manually send email reply |
-| POST | `/manual-set-reminder` | — | Manually set reminder |
-| GET | `/health` | — | Health check |
-| GET | `/docs` | — | Swagger UI |
+---
+
+## Tech Stack
+
+- **FastAPI** + **asyncpg** / SQLAlchemy async
+- **PostgreSQL** (with pgvector for embeddings)
+- **Gmail API** + **Google Calendar API**
+- **OpenRouter / Groq / OpenAI** (LLM fallback chain)
+- **Ollama** (local embeddings via nomic-embed-text)
+
+---
 
 ## Setup
 
 ### 1. Prerequisites
 
 - Python 3.11+
-- PostgreSQL 14+ with [pgvector](https://github.com/pgvector/pgvector) extension
-- [Ollama](https://ollama.ai) running `nomic-embed-text` for embeddings
-
-### 2. Install dependencies
+- PostgreSQL 15+
+- Ollama running locally with `nomic-embed-text` pulled
 
 ```bash
-cd email_manager
+ollama pull nomic-embed-text
+```
+
+### 2. Install pgvector
+
+```bash
+sudo apt install postgresql-15-pgvector -y
+```
+
+> If pgvector is unavailable, the schema falls back to `FLOAT[]` — embeddings still work, you just lose vector similarity search.
+
+### 3. Clone & install dependencies
+
+```bash
+cd ai_email_manager
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure environment
+### 4. Configure environment
 
 ```bash
 cp .env.example .env
-# Edit .env with your credentials
 ```
 
-Required values in `.env`:
+Edit `.env` with your credentials:
 
 ```env
-DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/email_manager
-OPENROUTER_API_KEY=sk-or-...
-GROQ_API_KEY=gsk_...
-GEMINI_API_KEY=AIza...
-OPENAI_API_KEY=sk-...
+DATABASE_URL=postgresql+asyncpg://mailuser:mailpass@localhost:5432/ai_email_manager
+
+OPENROUTER_API_KEY=your_key
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+
+GROQ_API_KEY=your_key
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+
+OPENAI_API_KEY=your_key
+
+GEMINI_API_KEY=your_key
+
+OLLAMA_EMBEDDING_URL=http://localhost:11434/api/embeddings
+EMBEDDING_MODEL=nomic-embed-text
+
+DEFAULT_TIMEZONE=UTC
+AI_CONFIDENCE_THRESHOLD=0.7
+BULK_THRESHOLD=50
+EMAIL_FETCH_LIMIT=20
 ```
 
-### 4. Create the database
+### 5. Create the database
 
-```sql
-CREATE DATABASE email_manager;
-\c email_manager
-CREATE EXTENSION IF NOT EXISTS vector;
+```bash
+sudo -u postgres psql -c "CREATE USER mailuser WITH PASSWORD 'mailpass';"
+sudo -u postgres psql -c "CREATE DATABASE ai_email_manager OWNER mailuser;"
+python setup_db.py
 ```
 
-Tables are created automatically on startup.
-
-### 5. Start the server
+### 6. Run
 
 ```bash
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Visit `http://localhost:8000/docs` for the interactive Swagger UI.
+---
+
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/email-manager` | Main ingestion — fetch, analyse, and act on emails |
+| POST | `/ingest_email_bulk` | Bulk ingest up to 500 emails |
+| POST | `/get-emails` | Retrieve stored emails for a user |
+| POST | `/eod-summary-generate` | Generate end-of-day summary |
+| POST | `/show-eod` | Show or regenerate today's EOD summary |
+| POST | `/send-eod-email` | Email the EOD summary to the user |
+| POST | `/chat-email` | Chat with your emails using natural language |
+| POST | `/action_status` | Update action status on an email record |
+| POST | `/manual-create-calendar` | Manually create a calendar event |
+| POST | `/manual-send-reply` | Manually send a reply |
+| POST | `/manual-set-reminder` | Manually set a reminder |
+| GET  | `/health` | Health check |
+| GET  | `/docs` | Swagger UI |
 
 ---
 
-## Usage Examples
+## Request Examples
 
-### Trigger email ingestion
-
+### Ingest emails
 ```bash
 curl -X POST http://localhost:8000/email-manager \
   -H "Content-Type: application/json" \
   -d '{
-    "access_token": "ya29...",
-    "refresh_token": "1//...",
-    "user_email": "user@gmail.com",
-    "autoMode": true
+    "access_token": "YOUR_GMAIL_TOKEN",
+    "refresh_token": "YOUR_REFRESH_TOKEN",
+    "user_email": "you@gmail.com",
+    "autoMode": false
   }'
 ```
 
-### Chat with your emails
+### Show EOD summary
+```bash
+curl -X POST http://localhost:8000/show-eod \
+  -H "Content-Type: application/json" \
+  -d '{"user_email": "you@gmail.com"}'
+```
 
+### Chat with emails
 ```bash
 curl -X POST http://localhost:8000/chat-email \
   -H "Content-Type: application/json" \
   -d '{
-    "user_email": "user@gmail.com",
-    "query": "What did John say about the Q4 budget?"
+    "user_email": "you@gmail.com",
+    "query": "Any urgent emails I need to reply to?"
   }'
 ```
 
-### Get today's EOD summary
+---
 
-```bash
-curl -X POST http://localhost:8000/show-eod \
-  -H "Content-Type: application/json" \
-  -d '{"user_email": "user@gmail.com", "regenerate": false}'
+## Architecture
+
+```
+Gmail API
+   │
+   ▼
+Ingestion Router
+   ├── Dedup check (PostgreSQL)
+   ├── AI Analysis (OpenRouter → Groq → OpenAI fallback)
+   ├── Save to DB
+   ├── Generate embedding (Ollama nomic-embed-text)
+   └── Auto Actions (Calendar / Reply / Reminder)
+
+EOD Summary Router
+   ├── Aggregate today's emails
+   ├── LLM summary generation
+   └── Optional email delivery
+
+Chat Router
+   └── Semantic search + LLM answer
 ```
 
 ---
 
-## AI / LLM Fallback Chain
+## LLM Fallback & Rate Limiting
 
-Each workflow uses a cascading fallback across providers:
+The system uses a **3-provider fallback chain** with exponential backoff:
 
-| Order | Provider | Model |
-|-------|----------|-------|
-| 1 | OpenRouter | `openai/gpt-4o-free` |
-| 2 | Groq | `llama-3.3-70b-versatile` |
-| 3 | OpenAI | `gpt-4.1-mini` / `gpt-4o-mini` |
+- Each provider retries up to **3 times** on 429 / 5xx errors
+- Backoff starts at 1.5s and caps at 30s with ±25% jitter
+- A **concurrency semaphore** (default: 4) prevents thundering-herd when processing many emails simultaneously
+- If all providers fail, the request raises a clear error
 
-If all providers fail, a `500` error is returned.
-
----
-
-## Database Tables
-
-- **`email_store`** — Processed emails + AI analysis + vector embeddings
-- **`reminders`** — Reminder records with dates and status
-- **`eod_summaries`** — Daily AI-generated summaries per user
+To increase throughput on a paid plan, raise `LLM_CONCURRENCY` in `utils/ai.py`.
 
 ---
-
-## Auto-Mode Actions
-
-When `autoMode: true` is passed, the system automatically:
-
-- **Creates Google Calendar events** for emails with meeting requests (checks freeBusy first)
-- **Sends AI-drafted replies** for emails requiring a response
-- **Stores reminders** for time-sensitive emails
-- **Flags for manual review** when AI confidence < 0.7
